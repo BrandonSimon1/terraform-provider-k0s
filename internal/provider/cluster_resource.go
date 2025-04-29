@@ -12,7 +12,9 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/stringplanmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/types"
 	"github.com/k0sproject/dig"
+	action "github.com/k0sproject/k0sctl/action"
 	k0sctl_phase "github.com/k0sproject/k0sctl/phase"
+
 	k0sctl_v1beta1 "github.com/k0sproject/k0sctl/pkg/apis/k0sctl.k0sproject.io/v1beta1"
 	k0sctl_cluster "github.com/k0sproject/k0sctl/pkg/apis/k0sctl.k0sproject.io/v1beta1/cluster"
 	k0s_rig "github.com/k0sproject/rig"
@@ -193,9 +195,25 @@ func (r *ClusterResource) Create(ctx context.Context, req resource.CreateRequest
 		return
 	}
 
-	manager := getK0sctlManagerForCreateOrUpdate(data, k0sctlConfig)
+	manager, err := k0sctl_phase.NewManager(k0sctlConfig)
+	if err != nil {
+		resp.Diagnostics.AddError("k0sctl Error", fmt.Sprintf("cluster config not available in context"))
+		return
+	}
 
-	if err := manager.Run(); err != nil {
+  manager.Concurrency = int(data.Concurrency.ValueInt64())
+
+
+	applyOpts := action.ApplyOptions{
+		Manager: manager,
+    NoWait: data.NoWait.ValueBool(),
+    NoDrain: data.NoDrain.ValueBool(),
+	}
+
+
+	applyAction := action.NewApply(applyOpts)
+
+	if err := applyAction.Run(); err != nil {
 		resp.Diagnostics.AddError("k0sctl Error", fmt.Sprintf("Unable to create cluster, got error: %s", err))
 		return
 	}
@@ -226,25 +244,21 @@ func (r *ClusterResource) Read(ctx context.Context, req resource.ReadRequest, re
 
 	k0sctlConfig.Spec.Hosts = k0sctl_cluster.Hosts{k0sctlConfig.Spec.K0sLeader()}
 
-	manager := k0sctl_phase.Manager{
-		Config:      k0sctlConfig,
-		Concurrency: int(data.Concurrency.ValueInt64()),
+	manager, err := k0sctl_phase.NewManager(k0sctlConfig)
+	if err != nil {
+		resp.Diagnostics.AddError("k0sctl Error", fmt.Sprintf("cluster config not available in context"))
+		return
+	}
+	kubeconfigAction := action.Kubeconfig{
+		Manager: manager,
 	}
 
-	manager.AddPhase(
-		&k0sctl_phase.Connect{},
-		&k0sctl_phase.DetectOS{},
-		&k0sctl_phase.GatherK0sFacts{},
-		&k0sctl_phase.GetKubeconfig{},
-		&k0sctl_phase.Disconnect{},
-	)
-
-	if err := manager.Run(); err != nil {
-		resp.Diagnostics.AddError("k0sctl Error", fmt.Sprintf("Unable to read cluster, got error: %s", err))
+	if err := kubeconfigAction.Run(); err != nil {
+		resp.Diagnostics.AddError("k0sctl Error", fmt.Sprintf("getting kubeconfig failed: %w", err))
 		return
 	}
 
-	data.Kubeconfig = types.StringValue(k0sctlConfig.Metadata.Kubeconfig)
+	data.Kubeconfig = types.StringValue(kubeconfigAction.Manager.Config.Metadata.Kubeconfig)
 
 	resp.Diagnostics.Append(resp.State.Set(ctx, &data)...)
 }
@@ -267,10 +281,20 @@ func (r *ClusterResource) Update(ctx context.Context, req resource.UpdateRequest
 		return
 	}
 
-	manager := getK0sctlManagerForCreateOrUpdate(data, k0sctlConfig)
+	manager, err := k0sctl_phase.NewManager(k0sctlConfig)
+	if err != nil {
+		resp.Diagnostics.AddError("k0sctl Error", fmt.Sprintf("cluster config not available in context"))
+		return
+	}
 
-	if err := manager.Run(); err != nil {
-		resp.Diagnostics.AddError("k0sctl Error", fmt.Sprintf("Unable to update cluster, got error: %s", err))
+	applyOpts := action.ApplyOptions{
+		Manager: manager,
+	}
+
+	applyAction := action.NewApply(applyOpts)
+
+	if err := applyAction.Run(); err != nil {
+		resp.Diagnostics.AddError("k0sctl Error", fmt.Sprintf("Unable to create cluster, got error: %s", err))
 		return
 	}
 
@@ -297,35 +321,17 @@ func (r *ClusterResource) Delete(ctx context.Context, req resource.DeleteRequest
 		return
 	}
 
-	manager := k0sctl_phase.Manager{
-		Config:      k0sctlConfig,
-		Concurrency: int(data.Concurrency.ValueInt64()),
+	manager, err := k0sctl_phase.NewManager(k0sctlConfig)
+	if err != nil {
+		resp.Diagnostics.AddError("k0sctl Error", fmt.Sprintf("cluster config not available in context"))
 	}
 
-	lockPhase := &k0sctl_phase.Lock{}
+	resetAction := action.Reset{
+		Manager: manager,
+	}
 
-	manager.AddPhase(
-		&k0sctl_phase.Connect{},
-		&k0sctl_phase.DetectOS{},
-		lockPhase,
-		&k0sctl_phase.PrepareHosts{},
-		&k0sctl_phase.GatherK0sFacts{},
-		&k0sctl_phase.ResetWorkers{
-			NoDrain:  true,
-			NoDelete: true,
-		},
-		&k0sctl_phase.ResetControllers{
-			NoDrain:  true,
-			NoDelete: true,
-			NoLeave:  true,
-		},
-		&k0sctl_phase.ResetLeader{},
-		&k0sctl_phase.Unlock{Cancel: lockPhase.Cancel},
-		&k0sctl_phase.Disconnect{},
-	)
-
-	if err := manager.Run(); err != nil {
-		resp.Diagnostics.AddError("k0sctl Error", fmt.Sprintf("Unable to delete cluster, got error: %s", err))
+	if err := resetAction.Run(); err != nil {
+		resp.Diagnostics.AddError("k0sctl Error", fmt.Sprintf("reset failed: %w", err))
 		return
 	}
 }
@@ -338,53 +344,6 @@ func (r *ClusterResource) Configure(ctx context.Context, req resource.ConfigureR
 	if req.ProviderData == nil {
 		return
 	}
-}
-
-func getK0sctlManagerForCreateOrUpdate(data *ClusterResourceModel, k0sctlConfig *k0sctl_v1beta1.Cluster) k0sctl_phase.Manager {
-	k0sctl_phase.NoWait = data.NoWait.ValueBool()
-
-	manager := k0sctl_phase.Manager{
-		Config:      k0sctlConfig,
-		Concurrency: int(data.Concurrency.ValueInt64()),
-	}
-
-	lockPhase := &k0sctl_phase.Lock{}
-
-	manager.AddPhase(
-		&k0sctl_phase.Connect{},
-		&k0sctl_phase.DetectOS{},
-		lockPhase,
-		&k0sctl_phase.PrepareHosts{},
-		&k0sctl_phase.GatherFacts{},
-		&k0sctl_phase.DownloadBinaries{},
-		&k0sctl_phase.UploadFiles{},
-		&k0sctl_phase.ValidateHosts{},
-		&k0sctl_phase.GatherK0sFacts{},
-		&k0sctl_phase.ValidateFacts{},
-		&k0sctl_phase.UploadBinaries{},
-		&k0sctl_phase.DownloadK0s{},
-		&k0sctl_phase.InstallBinaries{},
-		&k0sctl_phase.PrepareArm{},
-		&k0sctl_phase.ConfigureK0s{},
-		&k0sctl_phase.InitializeK0s{},
-		&k0sctl_phase.InstallControllers{},
-		&k0sctl_phase.InstallWorkers{},
-		&k0sctl_phase.UpgradeControllers{},
-		&k0sctl_phase.UpgradeWorkers{
-			NoDrain: data.NoDrain.ValueBool(),
-		},
-		&k0sctl_phase.ResetWorkers{
-			NoDrain: data.NoDrain.ValueBool(),
-		},
-		&k0sctl_phase.ResetControllers{
-			NoDrain: data.NoDrain.ValueBool(),
-		},
-		&k0sctl_phase.GetKubeconfig{},
-		&k0sctl_phase.Unlock{Cancel: lockPhase.Cancel},
-		&k0sctl_phase.Disconnect{},
-	)
-
-	return manager
 }
 
 func getK0sctlConfig(ctx context.Context, dia *diag.Diagnostics, data *ClusterResourceModel) *k0sctl_v1beta1.Cluster {
